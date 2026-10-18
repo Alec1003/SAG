@@ -62,7 +62,7 @@ SAG 不是传统 RAG 与 GraphRAG 的融合，而是一套替代二者的原创�
 | 能力 | 解决的问题 |
 | --- | --- |
 | 知识导入 | 文件与网页信源、文档解析、分块、向量化、事件/实体抽取、后台处理 |
-| 检索 | 跨信源或指定信源检索，支持快速（`vector`）、快速（`multi_es_fast`）与精确（`multi`）模式 |
+| 检索 | 跨信源或指定信源检索，支持快速（`vector` / `multi_es_fast`）、精确（`multi`）与可选 JEV 精排（`multi_jev`）模式 |
 | 原文溯源 | 每条检索结果和引用都能打开对应的原文块 |
 | 知识图谱 | 查看事件、实体及其可查询的关联关系 |
 | Agent 对话 | 基于指定信源进行多轮问答，并提供可点击引用 |
@@ -194,7 +194,7 @@ DeepSeek 使用 Flash 非思考模式。两种快速配置均可选择 302.AI、
 
 Docker Compose 或 `.env` 中的 `SAG_LLM_*` 用于提供首次启动时的模型默认值。管理员在 Web 设置页保存模型配置后，后续抽取和生成任务会直接使用已持久化的设置，无需重启服务。
 
-默认向量模型为 `Qwen/Qwen3-Embedding-4B`。升级已有 BGE 索引时，请保留 `SAG_EMBEDDING_MODEL=bge-large-en-v1.5`；如需切换模型，请先完成已有索引文档的删除，再更换模型并重新导入。
+新配置入口建议生成模型 `qwen3.8-flash`、向量模型 `Qwen/Qwen3-Embedding-4B`。升级会保留已保存的模型设置和显式环境配置；未显式设置生成模型的部署仍沿用原运行默认值 `qwen3.6-flash`。升级已有 BGE 索引时，请保留 `SAG_EMBEDDING_MODEL=bge-large-en-v1.5`；如需切换模型，请先完成已有索引文档的删除，再更换模型并重新导入。
 
 如需由部署环境强制统一配置，请设置 `SAG_LOCK_LLM_CONFIG=true`。SAG 会在设置页明确显示生成模型字段已锁定，并持续使用 `SAG_LLM_*` 的值。此时请修改 Docker Compose 或 `.env`，再重新创建 API 容器使改动生效。API Key 始终由部署环境管理，Settings API 不会返回密钥明文。
 
@@ -488,7 +488,7 @@ async def main() -> None:
         llm=LLMConfig(
             api_key="sk-...",
             base_url="https://your-openai-compatible-host/v1",
-            model="qwen3.6-flash",
+            model="qwen3.8-flash",
         ),
         # 不填写 api_key/base_url 时，Embedding 会复用 LLM 接口。
         embedding=EmbeddingConfig(model="Qwen/Qwen3-Embedding-4B"),
@@ -531,7 +531,7 @@ asyncio.run(main())
 export SAG_STORAGE_MODE=normal
 export OPENAI_API_KEY=sk-...
 export OPENAI_BASE_URL=https://your-openai-compatible-host/v1
-export LLM_MODEL=qwen3.6-flash
+export LLM_MODEL=qwen3.8-flash
 export EMBEDDING_MODEL=Qwen/Qwen3-Embedding-4B
 ```
 
@@ -565,8 +565,13 @@ config = EngineConfig.from_env()
 | 快速（vector） | `vector` | 基于语义相似度直接召回，响应更快 |
 | 快速（multi_es-fast） | `multi_es_fast` | BM25 实体召回与事件多跳检索，跳过 LLM 精排 |
 | 精确 | `multi` | 结合实体关系与 LLM 精排，结果更完整 |
+| JEV 精排 | `multi_jev` | 召回与图扩展后，通过独立 JEV 服务为候选证据评分 |
 
 这里列出的是应用/API 策略名称；应用将 `multi` 映射到 Python 引擎的 `full_expand`，将 `multi_es_fast` 映射到 `pruned_expand_rff`。可用性取决于存储能力：`multi_es_fast` 需要词法检索支持。
+
+在“设置 → 知识库 → 检索”配置 302.AI、TypeSafe 官方或自定义 JEV 服务（默认 `jev-latest`，独立 API Key），再选择 **JEV 精排**。仅保存服务不会启用；默认限时 30 秒、失败报错，可选择粗排降级。
+
+支持 LanceDB、Elasticsearch，暂不支持 pgvector；PostgreSQL 作为关系库不受影响。未启用时沿用原检索策略，已有文档无需重新入库。效果与成本见[更新日志](CHANGELOG.md#jev-reranking)。
 
 #### 存储后端
 

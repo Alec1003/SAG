@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from sag_api.core.config import Settings
+from sag_api.core.config import Settings, expand_embedding_dimensions
 from sag_api.core.config import settings as _settings
 from sag_api.core.embedding_presets import QUICK_SETUP_EMBEDDINGS, EmbeddingSetupProvider
 from sag_api.core.errors import ConfigurationError, ConflictError
@@ -22,11 +23,14 @@ from sag_api.core.logging import get_logger
 from sag_api.core.model_providers import get_model_provider
 from sag_api.db.models import Document, Setting
 from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
+from sag_api.schemas.system import ModelConfigUpdate
 
 _SCOPE = "global"
 _KEY = "model_config"
 _PREFERENCES_KEY = "system_preferences"
 log = get_logger("settings")
+# Runtime settings are process-local; serialize each read/merge/commit/publication.
+_MODEL_CONFIG_SAVE_LOCK = asyncio.Lock()
 
 # 允许运行期覆盖的字段（值已由请求 schema 校验/转型）
 _FIELDS = frozenset(
@@ -48,6 +52,11 @@ _FIELDS = frozenset(
         "embedding_base_url",
         "embedding_api_key",
         "embedding_dimensions",
+        "jev_endpoint",
+        "jev_model",
+        "jev_api_key",
+        "jev_ranking_timeout_seconds",
+        "jev_failure_policy",
         "document_parser",
         "mineru_provider",
         "mineru_base_url",
@@ -63,8 +72,13 @@ _FIELDS = frozenset(
         "sag_language",
     }
 )
-_SECRET_FIELDS = frozenset({"llm_api_key", "embedding_api_key", "mineru_api_key"})
-_NULLABLE_FIELDS = frozenset({"llm_base_url", "embedding_base_url", "embedding_dimensions", "mineru_base_url"})
+# New explicit dimension saves pin both meanings in the existing JSON row. Old
+# rows with only the alias retain their original split-environment precedence.
+_PERSISTED_FIELDS = _FIELDS | {"embedding_schema_dimensions", "embedding_request_dimensions"}
+_SECRET_FIELDS = frozenset({"llm_api_key", "embedding_api_key", "mineru_api_key", "jev_api_key"})
+_NULLABLE_FIELDS = frozenset({
+    "llm_base_url", "embedding_base_url", "embedding_dimensions", "mineru_base_url", "jev_endpoint",
+})
 _LOCKABLE_LLM_FIELDS = frozenset(
     {
         "llm_provider",
@@ -83,6 +97,7 @@ _LOCKABLE_LLM_FIELDS = frozenset(
     }
 )
 _MODEL_CONFIG_SOURCES = {field: "default" for field in _FIELDS - _SECRET_FIELDS}
+_JEV_FIELDS = frozenset(field for field in _FIELDS if field.startswith("jev_"))
 
 _OPENAI_COMPATIBLE = get_model_provider("openai")
 
@@ -136,11 +151,8 @@ def _embedding_identity(settings: Settings, patch: dict) -> tuple[str, int]:
     UI/API 仍只暴露单一 `embedding_dimensions` 字段，它同时映射到 schema 与请求
     两项。未随 patch 传入时取配置的生效 schema 维度（含新字段与旧别名）。
     """
-    model = str(patch.get("embedding_model", settings.embedding_model))
-    if "embedding_dimensions" in patch:
-        dimensions = patch["embedding_dimensions"]
-        return model, int(dimensions or settings.effective_embedding_schema_dimensions)
-    return model, settings.effective_embedding_schema_dimensions
+    proposed = settings.model_copy(update=expand_embedding_dimensions(patch))
+    return str(proposed.embedding_model), proposed.effective_embedding_schema_dimensions
 
 
 async def _reject_incompatible_embedding_change(
@@ -196,9 +208,9 @@ def _normalize_overrides(overrides: dict) -> dict:
     if strategy == "atomic":
         normalized["search_strategy"] = normalize_search_strategy(strategy)
         log.warning("旧检索策略 atomic 已迁移为精确模式 multi")
-    elif strategy is not None and strategy not in SEARCH_STRATEGIES:
+    elif isinstance(strategy, str) and strategy not in SEARCH_STRATEGIES:
         normalized.pop("search_strategy", None)
-        log.warning("忽略非法的持久化检索策略：%s", strategy)
+        log.warning("忽略非法的持久化检索策略字段 search_strategy")
     return normalized
 
 
@@ -224,14 +236,34 @@ def apply_overrides(settings: Settings, overrides: dict) -> None:
     """把持久化配置写回 settings；部署锁定时保留 LLM 环境值。"""
     normalized = _normalize_overrides(overrides)
     locked_fields = _LOCKABLE_LLM_FIELDS if settings.lock_llm_config else frozenset()
-    for key, value in normalized.items():
-        if key in _FIELDS and key not in locked_fields:
-            setattr(settings, key, value)
+    updates = {
+        key: value for key, value in normalized.items() if key in _PERSISTED_FIELDS and key not in locked_fields
+    }
+    # Existing fields retain the pre-JEV overlay contract. Validate only the
+    # optional new service so an unused JEV draft cannot stop existing models.
+    jev_updates = {key: value for key, value in updates.items() if key in _JEV_FIELDS}
+    if jev_updates:
+        try:
+            validated = ModelConfigUpdate.model_validate(jev_updates).model_dump(exclude_unset=True)
+        except ValueError:
+            log.warning("忽略无效的持久化 JEV 配置；现有模型与检索设置保持独立")
+            updates = {key: value for key, value in updates.items() if key not in _JEV_FIELDS}
+        else:
+            updates.update(validated)
+    # A changed scoring destination must not inherit another endpoint's key.
+    if (
+        "jev_endpoint" in updates
+        and updates["jev_endpoint"] != settings.jev_endpoint
+        and "jev_api_key" not in updates
+    ):
+        updates["jev_api_key"] = None
+    for key, value in updates.items():
+        setattr(settings, key, value)
     if settings is _settings:
         for key in _MODEL_CONFIG_SOURCES:
             if key in locked_fields:
                 _MODEL_CONFIG_SOURCES[key] = "environment_policy"
-            elif key in normalized:
+            elif key in updates:
                 _MODEL_CONFIG_SOURCES[key] = "database"
 
 
@@ -341,8 +373,17 @@ def effective_model_config() -> dict:
         "llm_api_key_set": bool(_settings.llm_api_key),
         "embedding_model": _settings.embedding_model,
         "embedding_base_url": _settings.embedding_base_url,
-        "embedding_dimensions": _settings.embedding_dimensions,
+        "embedding_dimensions": (
+            _settings.effective_embedding_schema_dimensions
+            if _settings.embedding_schema_dimensions is not None
+            else _settings.embedding_dimensions
+        ),
         "embedding_api_key_set": bool(_settings.embedding_api_key),
+        "jev_endpoint": _settings.jev_endpoint,
+        "jev_model": _settings.jev_model,
+        "jev_api_key_set": bool(_settings.jev_api_key),
+        "jev_ranking_timeout_seconds": _settings.jev_ranking_timeout_seconds,
+        "jev_failure_policy": _settings.jev_failure_policy,
         "document_parser": _settings.document_parser,
         "effective_document_parser": _settings.effective_document_parser,
         "mineru_provider": _settings.mineru_provider,
@@ -392,6 +433,20 @@ async def save_model_config(session: AsyncSession, patch: dict) -> dict:
     - 密钥字段值为空 → 忽略（保留原密钥，避免误清空）；空值仅经显式非空覆盖；
     - 可空字段（base_url / dimensions）值为空 → 置 None（清除）。
     """
+    async with _MODEL_CONFIG_SAVE_LOCK:
+        return await _save_model_config_locked(session, patch)
+
+
+async def _save_model_config_locked(session: AsyncSession, patch: dict) -> dict:
+    # Validate this card's explicit writes only. Re-validating the entire saved
+    # profile here would change older accepted values in unrelated model cards.
+    try:
+        patch = ModelConfigUpdate.model_validate(patch).model_dump(exclude_unset=True)
+    except ValueError:
+        raise ConfigurationError("Invalid model configuration; check the service settings") from None
+    if any(value is None and key not in _NULLABLE_FIELDS | _SECRET_FIELDS for key, value in patch.items()):
+        raise ConfigurationError("模型配置字段不能为 null，请填写有效值")
+    before = _settings
     await _reject_incompatible_embedding_change(session, patch)
     row = await _load_row(session)
     raw = dict(row.value) if row and isinstance(row.value, dict) else {}
@@ -403,6 +458,8 @@ async def save_model_config(session: AsyncSession, patch: dict) -> dict:
         if _settings.lock_llm_config and key in _LOCKABLE_LLM_FIELDS:
             continue
         if key in _SECRET_FIELDS:
+            if key == "jev_api_key" and isinstance(value, str):
+                value = value.strip()
             if value:  # 仅非空才更新；空/None 保留原值
                 stored[key] = str(value)
             continue
@@ -411,23 +468,47 @@ async def save_model_config(session: AsyncSession, patch: dict) -> dict:
             continue
         stored[key] = value
 
+    if "embedding_dimensions" in patch:
+        stored.update(expand_embedding_dimensions({"embedding_dimensions": stored["embedding_dimensions"]}))
     stored = _normalize_overrides(stored)
     candidate = {**_settings.model_dump(), **stored}
     if _settings.lock_llm_config:
         candidate.update({key: getattr(_settings, key) for key in _LOCKABLE_LLM_FIELDS})
+    if patch.keys() & _JEV_FIELDS:
+        try:
+            jev_candidate = ModelConfigUpdate.model_validate({key: candidate[key] for key in _JEV_FIELDS})
+        except ValueError:
+            raise ConfigurationError("Invalid JEV configuration; check endpoint, model and scoring options") from None
+        normalized_jev = jev_candidate.model_dump(exclude_unset=True)
+        candidate.update(normalized_jev)
+        stored.update({key: normalized_jev[key] for key in stored.keys() & _JEV_FIELDS})
     if candidate["llm_provider"] == "responses":
         try:
-            Settings.model_validate(candidate)
+            # The existing Responses bundle validation remains unchanged; an
+            # unused persisted JEV draft is outside that generation contract.
+            Settings.model_validate({**candidate, **{key: getattr(_settings, key) for key in _JEV_FIELDS}})
         except ValueError:
             raise ConfigurationError(
                 "Invalid Responses configuration; check endpoint, API version and reasoning options"
             ) from None
+    if patch.get("search_strategy") == "multi_jev":
+        from sag_api.sag.engine_manager import EngineManager
+
+        EngineManager.require_jev_capabilities(_settings.model_copy(update=candidate))
+    # Credentials belong to their scoring endpoint; a new destination must not
+    # inherit the old secret, including an environment-supplied secret.
+    if str(patch.get("jev_api_key") or "").strip():
+        # Key-only updates must also pin their current destination (including None),
+        # so a future environment endpoint cannot silently receive a saved secret.
+        stored["jev_endpoint"] = candidate["jev_endpoint"]
+    elif "jev_endpoint" in patch and candidate["jev_endpoint"] != raw.get("jev_endpoint", _settings.jev_endpoint):
+        stored["jev_api_key"] = None
     identity = ("llm_provider", "llm_responses_provider", "llm_responses_endpoint")
     if (
         not _settings.lock_llm_config
         and not patch.get("llm_api_key")
-        and (candidate["llm_provider"] == "responses" or _settings.llm_provider == "responses")
-        and any(candidate[field] != getattr(_settings, field) for field in identity)
+        and (candidate["llm_provider"] == "responses" or before.llm_provider == "responses")
+        and any(field in patch and candidate[field] != getattr(before, field) for field in identity)
     ):
         stored["llm_api_key"] = ""
 
