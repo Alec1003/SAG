@@ -50,8 +50,22 @@ import type {
 
 export type QuickSetupEmbeddingProvider = "302" | "zhipu" | "bailian";
 
+function desktopApiBase(): string | undefined {
+  const value = typeof window !== "undefined" ? window.sagDesktop?.apiBase : undefined;
+  if (typeof value !== "string" || !value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 浏览器通过局域网 IP 打开前端时，自动将 API 指向同主机 8000 端口。 */
-function resolveApiBase(): string {
+export function resolveApiBase(): string {
+  const desktopBase = desktopApiBase();
+  if (desktopBase) return desktopBase;
   const configured = process.env.NEXT_PUBLIC_API_BASE;
   if (typeof window !== "undefined") {
     const { protocol, hostname } = window.location;

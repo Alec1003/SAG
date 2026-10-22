@@ -18,6 +18,7 @@ const DESKTOP_CHANNELS = {
 export interface SagDesktopBridge {
   readonly isDesktop: true;
   readonly platform: NodeJS.Platform;
+  readonly apiBase?: string;
   appInfo(): Promise<{ version: string; platform: NodeJS.Platform; arch: string }>;
   checkForUpdates(): Promise<{ supported: boolean }>;
   getUpdateState(): Promise<UpdateState>;
@@ -27,9 +28,25 @@ export interface SagDesktopBridge {
   onUpdateState(listener: (state: UpdateState) => void): () => void;
 }
 
+function readApiBase(): string | undefined {
+  const prefix = "--sag-api-base=";
+  const value = process.argv.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    if (url.hostname !== "localhost" && url.hostname !== "127.0.0.1") return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+const apiBase = readApiBase();
 const bridge: SagDesktopBridge = Object.freeze({
   isDesktop: true,
   platform: process.platform,
+  ...(apiBase ? { apiBase } : {}),
   appInfo: () => ipcRenderer.invoke(DESKTOP_CHANNELS.appInfo),
   checkForUpdates: () => ipcRenderer.invoke(DESKTOP_CHANNELS.checkForUpdates),
   getUpdateState: () => ipcRenderer.invoke(DESKTOP_CHANNELS.getUpdateState),

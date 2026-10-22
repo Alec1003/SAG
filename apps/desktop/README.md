@@ -162,7 +162,7 @@ npm run package:dir
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `SAG_DESKTOP_APP_ID` | `ai.zleap.sag` | 应用唯一标识；首次公开发布后不得随意修改 |
-| `SAG_DESKTOP_API_PORT` | `8000` | 本地 API 端口；同时写入 Web 构建和桌面运行时 |
+| `SAG_DESKTOP_API_PORT` | `8000` | 本地 API 首选端口；写入 Web 构建回退值，打包运行时若被占用会向后寻找并持久化 |
 | `SAG_DESKTOP_WEB_PORT` | `32100` | 本地 Web 首选端口；被占用时向后寻找可用端口 |
 | `SAG_UPDATE_GITHUB_REPOSITORY` | 未设置 | GitHub 更新源，格式 `owner/repository`；正式流水线传入 `Zleap-AI/SAG` |
 | `SAG_UPDATE_BASE_URL` | 未设置 | 备用通用更新源根地址；不能与 GitHub 更新源同时设置 |
@@ -172,14 +172,14 @@ npm run package:dir
 
 macOS 签名凭据只注入 electron-builder 的最终签名与公证步骤，不会传给 Next.js、PyInstaller 或它们的构建依赖，也不写入仓库。Windows 当前不注入签名凭据。应用图标母版和平台产物位于 `apps/desktop/assets/icon-master.png`、`icon.icns` 与 `icon.ico`。
 
-`SAG_DESKTOP_API_PORT` 属于发布构建参数，不建议交给最终用户修改，因为 Next.js 中的 API Base 是构建时值。若确实修改，构建和运行阶段必须保持一致。
+`SAG_DESKTOP_API_PORT` 仍是构建与首次启动的首选端口。打包客户端在 8000 已被占用时会自动选择附近可用端口，写入 `userData/desktop-runtime.json`，并通过桌面桥把实际 API 地址交给前端。已持久化的端口被其他进程占用时不会悄悄更换，以免 MCP 等外部入口漂移。
 
 ## 运行与数据目录
 
 正式客户端只监听 loopback：
 
 - Web：`localhost:32100` 起的动态端口；
-- API/MCP：`127.0.0.1:8000`。
+- API/MCP：`127.0.0.1:8000` 起的动态端口，首次可用端口会写入用户数据目录。
 
 数据库、上传文件、知识引擎数据和桌面运行密钥不写入安装目录，而是写入 Electron 标准 `userData` 目录：
 

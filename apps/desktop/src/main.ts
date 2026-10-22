@@ -477,9 +477,22 @@ function createFnOsHostWindow(profile: WorkspaceProfile): HostWindow {
   };
 }
 
+function rendererApiBase(): string | undefined {
+  const apiUrl = runtime.session?.apiUrl;
+  if (!apiUrl) return undefined;
+  try {
+    const parsed = new URL(apiUrl);
+    if (!parsed.port) return undefined;
+    return `http://localhost:${parsed.port}`;
+  } catch {
+    return undefined;
+  }
+}
+
 function createMainWindow(webUrl: string, profile?: WorkspaceProfile): BrowserWindow {
   const remote = profile?.kind === "remote-web";
   trustedOrigin = new URL(webUrl).origin;
+  const apiBase = remote ? undefined : rendererApiBase();
   const window = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -491,6 +504,7 @@ function createMainWindow(webUrl: string, profile?: WorkspaceProfile): BrowserWi
     webPreferences: {
       preload: remote ? undefined : path.join(__dirname, "preload.js"),
       partition: remote ? profile.partition : undefined,
+      additionalArguments: apiBase ? [`--sag-api-base=${apiBase}`] : [],
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,

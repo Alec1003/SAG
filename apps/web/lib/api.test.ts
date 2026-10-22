@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api, ApiError } from "./api";
+import { api, ApiError, resolveApiBase } from "./api";
 import { clearToken, setToken } from "./auth";
 
 class FakeXMLHttpRequest {
@@ -175,5 +175,29 @@ describe("uploadDocumentWithProgress", () => {
       code: "upload_failed",
       requestId: "request-rejected",
     } satisfies Partial<ApiError>);
+  });
+});
+
+describe("resolveApiBase", () => {
+  afterEach(() => {
+    delete window.sagDesktop;
+  });
+
+  it("uses the desktop bridge origin when the packaged client selected a non-default API port", () => {
+    window.sagDesktop = {
+      isDesktop: true,
+      apiBase: "http://localhost:8001",
+    } as typeof window.sagDesktop;
+
+    expect(resolveApiBase()).toBe("http://localhost:8001");
+  });
+
+  it("ignores an invalid desktop bridge origin", () => {
+    window.sagDesktop = {
+      isDesktop: true,
+      apiBase: "file:///etc/passwd",
+    } as typeof window.sagDesktop;
+
+    expect(resolveApiBase()).toMatch(/^https?:\/\//);
   });
 });

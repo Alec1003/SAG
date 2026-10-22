@@ -5,9 +5,11 @@ import path from "node:path";
 interface RuntimeStateFile {
   secretKey: string;
   webPort?: number;
+  apiPort?: number;
 }
 
 type PortAvailability = (port: number) => Promise<boolean>;
+type PersistedPortField = "webPort" | "apiPort";
 
 function runtimeStateFile(userDataDir: string): string {
   return path.join(userDataDir, "desktop-runtime.json");
@@ -38,6 +40,15 @@ function writeRuntimeState(userDataDir: string, state: RuntimeStateFile): void {
   );
 }
 
+function persistRuntimeState(userDataDir: string, patch: RuntimeStateFile): void {
+  const existing = readRuntimeState(userDataDir);
+  writeRuntimeState(userDataDir, {
+    secretKey: patch.secretKey,
+    webPort: patch.webPort ?? existing?.webPort,
+    apiPort: patch.apiPort ?? existing?.apiPort,
+  });
+}
+
 function isValidPort(value: unknown): value is number {
   return typeof value === "number"
     && Number.isInteger(value)
@@ -61,6 +72,8 @@ export interface ResolveWebPortOptions {
   /** Injectable sleep so tests stay fast and deterministic. */
   sleep?: (ms: number) => Promise<void>;
 }
+
+export type ResolveApiPortOptions = ResolveWebPortOptions;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,11 +101,14 @@ export function loadOrCreateRuntimeSecret(userDataDir: string): string {
   return secretKey;
 }
 
-export async function resolveStableWebPort(
+async function resolveStableRecordedPort(
   userDataDir: string,
+  field: PersistedPortField,
   preferredPort: number,
   isAvailable: PortAvailability,
-  options: ResolveWebPortOptions = {},
+  options: ResolveWebPortOptions,
+  heldError: (port: number) => Error,
+  exhaustedError: (preferred: number) => Error,
 ): Promise<number> {
   const {
     reuseAttempts = DEFAULT_REUSE_ATTEMPTS,
@@ -100,29 +116,20 @@ export async function resolveStableWebPort(
     sleep = delay,
   } = options;
   const existing = readRuntimeState(userDataDir);
-  if (isValidPort(existing?.webPort)) {
-    // Keep the browser origin (localhost:<port>) stable across launches. The
-    // login cookie (sag_token_<port>) and onboarding/model-setup localStorage are
-    // isolated per origin, so drifting to a new port silently logs the user out
-    // and makes the app demand model reconfiguration every launch. Wait for our
-    // own prior instance to release the socket rather than switching ports.
+  const persisted = existing?.[field];
+  if (isValidPort(persisted)) {
     if (
       await reclaimPersistedPort(
-        existing.webPort,
+        persisted,
         isAvailable,
         reuseAttempts,
         reusePollMs,
         sleep,
       )
     ) {
-      return existing.webPort;
+      return persisted;
     }
-    // Still held after the grace window: a foreign process owns the port. Fail
-    // loudly instead of drifting to a new origin and dropping the user's config.
-    throw new Error(
-      `Persisted desktop web port ${existing.webPort} is held by another process. `
-      + "Close whatever is using it and relaunch SAG.",
-    );
+    throw heldError(persisted);
   }
 
   for (
@@ -132,8 +139,51 @@ export async function resolveStableWebPort(
   ) {
     if (!(await isAvailable(port))) continue;
     const secretKey = existing?.secretKey ?? loadOrCreateRuntimeSecret(userDataDir);
-    writeRuntimeState(userDataDir, { secretKey, webPort: port });
+    persistRuntimeState(userDataDir, { secretKey, [field]: port });
     return port;
   }
-  throw new Error(`No available local port found near ${preferredPort}`);
+  throw exhaustedError(preferredPort);
+}
+
+export async function resolveStableWebPort(
+  userDataDir: string,
+  preferredPort: number,
+  isAvailable: PortAvailability,
+  options: ResolveWebPortOptions = {},
+): Promise<number> {
+  return resolveStableRecordedPort(
+    userDataDir,
+    "webPort",
+    preferredPort,
+    isAvailable,
+    options,
+    (port) => new Error(
+      `Persisted desktop web port ${port} is held by another process. `
+      + "Close whatever is using it and relaunch SAG.",
+    ),
+    (preferred) => new Error(`No available local port found near ${preferred}`),
+  );
+}
+
+export async function resolveStableApiPort(
+  userDataDir: string,
+  preferredPort: number,
+  isAvailable: PortAvailability,
+  options: ResolveApiPortOptions = {},
+): Promise<number> {
+  return resolveStableRecordedPort(
+    userDataDir,
+    "apiPort",
+    preferredPort,
+    isAvailable,
+    options,
+    (port) => new Error(
+      `Persisted desktop API port ${port} is held by another process. `
+      + "Close whatever is using it and relaunch SAG.",
+    ),
+    (preferred) => new Error(
+      `No available local API port found near ${preferred}. `
+      + "Close the conflicting service and relaunch SAG.",
+    ),
+  );
 }
