@@ -261,6 +261,7 @@ export interface ModelConfig {
   llm_max_tokens: number;
   llm_timeout_ms: number;
   llm_max_retries: number;
+  llm_structured_output_mode?: "auto" | "json_schema" | "json_object" | "prompt_only";
   llm_api_key_set: boolean;
   embedding_model: string;
   embedding_base_url: string | null;
@@ -302,6 +303,7 @@ export type ModelConfigPatch = Partial<{
   llm_max_tokens: number;
   llm_timeout_ms: number;
   llm_max_retries: number;
+  llm_structured_output_mode?: "auto" | "json_schema" | "json_object" | "prompt_only";
   embedding_model: string;
   embedding_base_url: string;
   embedding_api_key: string;
@@ -920,4 +922,16 @@ export interface OctxTransfer {
   cancellation_requested: boolean;
   created_at: string;
   updated_at: string;
+}
+
+
+export interface ClientAccessInfo {
+  protocol: "client-v1"; deployment: "standard" | "fnos"; server_id: string; api_url: string | null;
+  verification_uri: string | null; scope: string; access_days: number; refresh_days: number; absolute_days: number;
+}
+export interface ClientDevicePreview { client_name: string; user_code: string; scope: string; expires_in: number }
+export interface ClientAccessSession {
+  session_id: string; client_name: string; scope: string; generation: number;
+  access_expires_at: string; refresh_expires_at: string; absolute_expires_at: string;
+  revoked_at: string | null; last_used_at: string | null;
 }
